@@ -484,6 +484,23 @@ type DownloadMediaResponse struct {
 	Path     string `json:"path,omitempty"`
 }
 
+// CreateGroupRequest represents the request body for the create group API
+type CreateGroupRequest struct {
+	GroupName    string   `json:"group_name"`
+	Participants []string `json:"participants"`
+	Description  string   `json:"description,omitempty"`
+}
+
+// CreateGroupResponse represents the response for the create group API
+type CreateGroupResponse struct {
+	Success            bool     `json:"success"`
+	Message            string   `json:"message"`
+	GroupJID           string   `json:"group_jid,omitempty"`
+	GroupName          string   `json:"group_name,omitempty"`
+	AddedParticipants  []string `json:"added_participants,omitempty"`
+	FailedParticipants []string `json:"failed_participants,omitempty"`
+}
+
 // Store additional media info in the database
 func (store *MessageStore) StoreMediaInfo(id, chatJID, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
 	_, err := store.db.Exec(
@@ -675,6 +692,85 @@ func extractDirectPathFromURL(url string) string {
 	return "/" + pathPart
 }
 
+// Function to create a WhatsApp group
+func createWhatsAppGroup(client *whatsmeow.Client, groupName string, participants []string, description string) (bool, string, string, []string, []string, error) {
+	if !client.IsConnected() {
+		return false, "", "", nil, nil, fmt.Errorf("not connected to WhatsApp")
+	}
+
+	// Validate group name
+	if groupName == "" {
+		return false, "", "", nil, nil, fmt.Errorf("group name cannot be empty")
+	}
+
+	// Validate participants
+	if len(participants) == 0 {
+		return false, "", "", nil, nil, fmt.Errorf("at least one participant is required")
+	}
+
+	// Convert participants to JIDs
+	var participantJIDs []types.JID
+	var failedParticipants []string
+	var addedParticipants []string
+
+	for _, participant := range participants {
+		var participantJID types.JID
+		var err error
+
+		// Check if participant is already a JID
+		if strings.Contains(participant, "@") {
+			// Parse the JID string
+			participantJID, err = types.ParseJID(participant)
+			if err != nil {
+				failedParticipants = append(failedParticipants, participant)
+				continue
+			}
+		} else {
+			// Create JID from phone number
+			participantJID = types.JID{
+				User:   participant,
+				Server: "s.whatsapp.net",
+			}
+		}
+
+		participantJIDs = append(participantJIDs, participantJID)
+		addedParticipants = append(addedParticipants, participant)
+	}
+
+	// Create the group
+	groupResp, err := client.CreateGroup(whatsmeow.ReqCreateGroup{
+		Name:         groupName,
+		Participants: participantJIDs,
+		// Note: Description/Topic is set separately after creation if needed
+	})
+
+	if err != nil {
+		return false, "", "", nil, nil, fmt.Errorf("failed to create group: %v", err)
+	}
+
+	// Check if group was created successfully
+	if groupResp == nil {
+		return false, "", "", nil, nil, fmt.Errorf("group creation failed: no response received")
+	}
+
+	groupJID := groupResp.JID.String()
+
+	// Set group description/topic if provided
+	if description != "" {
+		err = client.SetGroupDescription(groupResp.JID, description)
+		if err != nil {
+			// Don't fail the entire operation, just log the warning
+			fmt.Printf("Warning: Failed to set group description: %v\n", err)
+		}
+	}
+
+	message := fmt.Sprintf("Group '%s' created successfully with %d participants", groupName, len(addedParticipants))
+
+	fmt.Printf("Group created: %s (JID: %s)\n", groupName, groupJID)
+
+	return true, message, groupJID, addedParticipants, failedParticipants, nil
+}
+
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
 	// Handler for sending messages
@@ -772,6 +868,69 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Filename: filename,
 			Path:     path,
 		})
+	})
+
+	// Handler for creating groups
+	http.HandleFunc("/api/create-group", func(w http.ResponseWriter, r *http.Request) {
+		// Only allow POST requests
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Parse the request body
+		var req CreateGroupRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		// Validate request
+		if req.GroupName == "" {
+			http.Error(w, "Group name is required", http.StatusBadRequest)
+			return
+		}
+
+		if len(req.Participants) == 0 {
+			http.Error(w, "At least one participant is required", http.StatusBadRequest)
+			return
+		}
+
+		fmt.Printf("Received request to create group '%s' with %d participants\n", req.GroupName, len(req.Participants))
+
+		// Create the group
+		success, message, groupJID, addedParticipants, failedParticipants, err := createWhatsAppGroup(
+			client, req.GroupName, req.Participants, req.Description)
+
+		// Set response headers
+		w.Header().Set("Content-Type", "application/json")
+
+		// Handle group creation result
+		if !success || err != nil {
+			errMsg := "Unknown error"
+			if err != nil {
+				errMsg = err.Error()
+			}
+
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(CreateGroupResponse{
+				Success: false,
+				Message: fmt.Sprintf("Failed to create group: %s", errMsg),
+			})
+			return
+		}
+
+		// Send successful response
+		json.NewEncoder(w).Encode(CreateGroupResponse{
+			Success:            true,
+			Message:            message,
+			GroupJID:           groupJID,
+			GroupName:          req.GroupName,
+			AddedParticipants:  addedParticipants,
+			FailedParticipants: failedParticipants,
+		})
+
+		fmt.Printf("Group creation completed: success=%t, JID=%s\n", success, groupJID)
 	})
 
 	// Start the server
