@@ -641,7 +641,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -708,6 +708,73 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		// Send the message
 		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
+
+		// Store the sent message in database if successful
+		if success {
+			// Prepare chat JID
+			chatJID := req.Recipient
+			if !strings.Contains(chatJID, "@") {
+				chatJID = req.Recipient + "@s.whatsapp.net"
+			}
+
+			// Generate a unique message ID for sent messages
+			msgID := fmt.Sprintf("sent_%d", time.Now().UnixNano())
+
+			// Determine media info if sending media
+			var mediaType, filename string
+			if req.MediaPath != "" {
+				// Extract media type from file extension
+				fileExt := strings.ToLower(req.MediaPath[strings.LastIndex(req.MediaPath, ".")+1:])
+				switch fileExt {
+				case "jpg", "jpeg", "png", "gif", "webp":
+					mediaType = "image"
+				case "ogg":
+					mediaType = "audio"
+				case "mp4", "avi", "mov":
+					mediaType = "video"
+				default:
+					mediaType = "document"
+				}
+				filename = req.MediaPath[strings.LastIndex(req.MediaPath, "/")+1:]
+			}
+
+			// Store the sent message
+			err := messageStore.StoreMessage(
+				msgID,                // message ID
+				chatJID,              // chat JID
+				client.Store.ID.User, // sender (your WhatsApp ID)
+				req.Message,          // content
+				time.Now(),           // timestamp
+				true,                 // isFromMe = true
+				mediaType,            // mediaType
+				filename,             // filename
+				"",                   // url (empty for sent messages)
+				nil,                  // mediaKey
+				nil,                  // fileSHA256
+				nil,                  // fileEncSHA256
+				0,                    // fileLength
+			)
+
+			if err != nil {
+				fmt.Printf("Failed to store sent message in database: %v\n", err)
+			} else {
+				// Log the stored message similar to incoming messages
+				timestamp := time.Now().Format("2006-01-02 15:04:05")
+				if mediaType != "" {
+					fmt.Printf("[%s] → %s: [%s: %s] %s\n", timestamp, req.Recipient, mediaType, filename, req.Message)
+				} else if req.Message != "" {
+					fmt.Printf("[%s] → %s: %s\n", timestamp, req.Recipient, req.Message)
+				}
+			}
+
+			// Update chat with the new message timestamp
+			name := req.Recipient // Simple fallback name
+			err = messageStore.StoreChat(chatJID, name, time.Now())
+			if err != nil {
+				fmt.Printf("Failed to update chat: %v\n", err)
+			}
+		}
+
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
 
@@ -800,14 +867,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -988,7 +1055,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
