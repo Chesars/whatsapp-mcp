@@ -16,10 +16,11 @@ BRIDGE_HOST = os.environ.get('BRIDGE_HOST', 'localhost')
 BRIDGE_PORT = os.environ.get('BRIDGE_PORT', '8080')
 WHATSAPP_API_BASE_URL = f"http://{BRIDGE_HOST}:{BRIDGE_PORT}/api"
 
-# For local setup, try Docker volume path first, then fallback to relative path
+# Database path configuration - prioritize local setup unless explicitly running in Docker
+USE_DOCKER_DB = os.environ.get('USE_DOCKER_DB', 'false').lower() == 'true'
 DOCKER_DB_PATH = '/data/store/messages.db'
 LOCAL_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
-MESSAGES_DB_PATH = DOCKER_DB_PATH if os.path.exists(DOCKER_DB_PATH) else LOCAL_DB_PATH
+MESSAGES_DB_PATH = DOCKER_DB_PATH if USE_DOCKER_DB else LOCAL_DB_PATH
 
 @dataclass
 class Message:
