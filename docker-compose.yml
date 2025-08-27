@@ -1,0 +1,24 @@
+services:
+  # WhatsApp Bridge - Deploy this on cloud/VPS
+  whatsapp-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile.bridge
+    container_name: whatsapp-bridge
+    ports:
+      - "8080:8080"
+    volumes:
+      - whatsapp-data:/data
+    environment:
+      - DATA_DIR=/data
+    restart: unless-stopped
+    # For initial QR code setup, run with:
+    # docker-compose run --rm whatsapp-bridge
+
+  # REMOVED: whatsapp-mcp services
+  # MCP server should run locally connecting to remote bridge
+  # Use: BRIDGE_HOST=your-server.com uv run main.py
+
+volumes:
+  whatsapp-data:
+    driver: local
