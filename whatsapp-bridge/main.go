@@ -1554,14 +1554,6 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			continue
 		}
 
-		// var unreadCount uint32 = 0
-		// if conversation.UnreadCount != nil {
-		// 	unreadCount = *conversation.UnreadCount
-		// 	// if unreadCount == 0 {
-		// 	// 	continue
-		// 	// }
-		// }
-
 		chatJID := *conversation.ID
 
 		// Try to parse the JID
