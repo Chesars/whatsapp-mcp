@@ -324,7 +324,6 @@ func (store *MessageStore) MarkChatAsRead(chatJID string) error {
 func (store *MessageStore) MarkChatAsUnread(chatJID string) error {
 	// Set unread count to 1 to indicate unread status
 	_, err := store.db.Exec("UPDATE chats SET unread_count = 1 WHERE jid = ?", chatJID)
-	// Mark chat as unread in database
 	return err
 }
 
