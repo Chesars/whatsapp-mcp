@@ -1,14 +1,25 @@
 import sqlite3
 from datetime import datetime
 from dataclasses import dataclass
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
 import os.path
 import requests
 import json
 import audio
+from dotenv import load_dotenv
 
-MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
-WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+# Load environment variables from config.env file
+load_dotenv('.env')
+
+# Configuration from environment variables or defaults
+BRIDGE_HOST = os.environ.get('BRIDGE_HOST', 'localhost')
+BRIDGE_PORT = os.environ.get('BRIDGE_PORT', '8080')
+WHATSAPP_API_BASE_URL = f"http://{BRIDGE_HOST}:{BRIDGE_PORT}/api"
+
+# For local setup, try Docker volume path first, then fallback to relative path
+DOCKER_DB_PATH = '/data/store/messages.db'
+LOCAL_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
+MESSAGES_DB_PATH = DOCKER_DB_PATH if os.path.exists(DOCKER_DB_PATH) else LOCAL_DB_PATH
 
 @dataclass
 class Message:
@@ -765,3 +776,113 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         return None
+
+def create_group(group_name: str, participants: List[str], description: Optional[str] = None) -> Tuple[bool, str, Optional[str], List[str], List[str]]:
+    """Create a WhatsApp group with the specified participants.
+    
+    Args:
+        group_name: The name for the new group
+        participants: List of phone numbers or JIDs to add to the group
+        description: Optional group description
+    
+    Returns:
+        A tuple containing:
+        - success: Whether the group was created successfully
+        - message: Status message
+        - group_jid: JID of the created group (if successful)
+        - added_participants: List of successfully added participants
+        - failed_participants: List of participants that couldn't be added
+    """
+    try:
+        # Validate input
+        if not group_name:
+            return False, "Group name must be provided", None, [], []
+        
+        if not participants or len(participants) == 0:
+            return False, "At least one participant must be provided", None, [], []
+        
+        url = f"{WHATSAPP_API_BASE_URL}/create-group"
+        payload = {
+            "group_name": group_name,
+            "participants": participants,
+            "description": description or ""
+        }
+        
+        response = requests.post(url, json=payload)
+        
+        # Check if the request was successful
+        if response.status_code == 200:
+            result = response.json()
+            success = result.get("success", False)
+            message = result.get("message", "Unknown response")
+            group_jid = result.get("group_jid", None) if success else None
+            added_participants = result.get("added_participants", [])
+            failed_participants = result.get("failed_participants", [])
+            
+            return success, message, group_jid, added_participants, failed_participants
+        else:
+            return False, f"Error: HTTP {response.status_code} - {response.text}", None, [], []
+            
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}", None, [], []
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}", None, [], []
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}", None, [], []
+def get_unread_messages(limit: int = 10) -> List[Dict[str, Any]]:
+    """Get an overview of recent chats with unread messages.
+    
+    Args:
+        limit: Maximum number of chats with unread messages to return (default 10)
+    
+    Returns:
+        A list of chat objects with unread message information
+    """
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        cursor = conn.cursor()
+        
+        # Get chats with unread messages (unread_count > 0)
+        cursor.execute("""
+            SELECT 
+                c.jid,
+                c.name,
+                c.last_message_time,
+                c.unread_count,
+                m.content as last_message,
+                m.sender as last_sender,
+                m.is_from_me as last_is_from_me
+            FROM chats c
+            LEFT JOIN messages m ON c.jid = m.chat_jid 
+                AND c.last_message_time = m.timestamp
+            WHERE c.unread_count > 0
+            ORDER BY c.last_message_time DESC
+            LIMIT ?
+        """, (limit,))
+        
+        chats = cursor.fetchall()
+        
+        result = []
+        for chat_data in chats:
+            chat_info = {
+                "jid": chat_data[0],
+                "name": chat_data[1],
+                "last_message_time": chat_data[2],
+                "unread_count": chat_data[3],
+                "last_message": chat_data[4],
+                "last_sender": chat_data[5],
+                "last_is_from_me": chat_data[6],
+                "is_group": chat_data[0].endswith("@g.us")
+            }
+            result.append(chat_info)
+        
+        return result
+        
+    except sqlite3.Error as e:
+        print(f"Database error: {e}")
+        return []
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+
