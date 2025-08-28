@@ -1373,7 +1373,6 @@ func main() {
 
 		case *events.MarkChatAsRead:
 			// Handle chat read status changes from other devices
-			// Handle chat read status changes from other devices
 			handleMarkChatAsRead(messageStore, v, logger)
 
 		case *events.Connected:
