@@ -304,6 +304,7 @@ def get_unread_messages(limit: int = 10) -> List[Dict[str, Any]]:
     unread_chats = whatsapp_get_unread_messages(limit)
     return unread_chats
 
+
 if __name__ == "__main__":
     # Initialize and run the server
     mcp.run(transport='stdio')

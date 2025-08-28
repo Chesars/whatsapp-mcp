@@ -1,7 +1,7 @@
 import sqlite3
 from datetime import datetime
 from dataclasses import dataclass
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
 import os.path
 import requests
 import json
@@ -829,3 +829,60 @@ def create_group(group_name: str, participants: List[str], description: Optional
         return False, f"Error parsing response: {response.text}", None, [], []
     except Exception as e:
         return False, f"Unexpected error: {str(e)}", None, [], []
+def get_unread_messages(limit: int = 10) -> List[Dict[str, Any]]:
+    """Get an overview of recent chats with unread messages.
+    
+    Args:
+        limit: Maximum number of chats with unread messages to return (default 10)
+    
+    Returns:
+        A list of chat objects with unread message information
+    """
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        cursor = conn.cursor()
+        
+        # Get chats with unread messages (unread_count > 0)
+        cursor.execute("""
+            SELECT 
+                c.jid,
+                c.name,
+                c.last_message_time,
+                c.unread_count,
+                m.content as last_message,
+                m.sender as last_sender,
+                m.is_from_me as last_is_from_me
+            FROM chats c
+            LEFT JOIN messages m ON c.jid = m.chat_jid 
+                AND c.last_message_time = m.timestamp
+            WHERE c.unread_count > 0
+            ORDER BY c.last_message_time DESC
+            LIMIT ?
+        """, (limit,))
+        
+        chats = cursor.fetchall()
+        
+        result = []
+        for chat_data in chats:
+            chat_info = {
+                "jid": chat_data[0],
+                "name": chat_data[1],
+                "last_message_time": chat_data[2],
+                "unread_count": chat_data[3],
+                "last_message": chat_data[4],
+                "last_sender": chat_data[5],
+                "last_is_from_me": chat_data[6],
+                "is_group": chat_data[0].endswith("@g.us")
+            }
+            result.append(chat_info)
+        
+        return result
+        
+    except sqlite3.Error as e:
+        print(f"Database error: {e}")
+        return []
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+
