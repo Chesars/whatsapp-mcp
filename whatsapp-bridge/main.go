@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"math"
 	"math/rand"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -54,6 +56,153 @@ type Chat struct {
 	UnreadCount     uint32
 }
 
+// Migration represents a database migration
+type Migration struct {
+	Version int
+	Name    string
+	SQL     string
+}
+
+// CreateSchemaMigrationsTable creates the migrations tracking table
+func CreateSchemaMigrationsTable(db *sql.DB) error {
+	_, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS schema_migrations (
+			version INTEGER PRIMARY KEY,
+			name TEXT NOT NULL,
+			applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		)
+	`)
+	return err
+}
+
+// GetAppliedMigrations returns list of applied migration versions
+func GetAppliedMigrations(db *sql.DB) (map[int]bool, error) {
+	applied := make(map[int]bool)
+	
+	rows, err := db.Query("SELECT version FROM schema_migrations")
+	if err != nil {
+		return applied, err
+	}
+	defer rows.Close()
+	
+	for rows.Next() {
+		var version int
+		if err := rows.Scan(&version); err != nil {
+			return applied, err
+		}
+		applied[version] = true
+	}
+	
+	return applied, nil
+}
+
+// LoadMigrationsFromFiles loads migration files from the migrations directory
+func LoadMigrationsFromFiles() ([]Migration, error) {
+	var migrations []Migration
+	
+	files, err := ioutil.ReadDir("migrations")
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Println("Migrations directory not found, skipping file-based migrations")
+			return migrations, nil
+		}
+		return nil, fmt.Errorf("failed to read migrations directory: %v", err)
+	}
+	
+	for _, file := range files {
+		if !strings.HasSuffix(file.Name(), ".sql") {
+			continue
+		}
+		
+		// Extract version from filename (e.g., "001_initial_schema.sql" -> 1)
+		parts := strings.SplitN(file.Name(), "_", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		
+		version, err := strconv.Atoi(parts[0])
+		if err != nil {
+			fmt.Printf("Warning: Could not parse version from file %s: %v\n", file.Name(), err)
+			continue
+		}
+		
+		// Read migration content
+		content, err := ioutil.ReadFile(filepath.Join("migrations", file.Name()))
+		if err != nil {
+			return nil, fmt.Errorf("failed to read migration file %s: %v", file.Name(), err)
+		}
+		
+		migration := Migration{
+			Version: version,
+			Name:    strings.TrimSuffix(file.Name(), ".sql"),
+			SQL:     string(content),
+		}
+		
+		migrations = append(migrations, migration)
+	}
+	
+	return migrations, nil
+}
+
+// RunMigrations applies pending migrations to the database
+func RunMigrations(db *sql.DB) error {
+	// Create migrations table
+	if err := CreateSchemaMigrationsTable(db); err != nil {
+		return fmt.Errorf("failed to create schema_migrations table: %v", err)
+	}
+	
+	// Get already applied migrations
+	applied, err := GetAppliedMigrations(db)
+	if err != nil {
+		return fmt.Errorf("failed to get applied migrations: %v", err)
+	}
+	
+	// Load migrations from files
+	migrations, err := LoadMigrationsFromFiles()
+	if err != nil {
+		return fmt.Errorf("failed to load migrations: %v", err)
+	}
+	
+	// Apply pending migrations
+	for _, migration := range migrations {
+		if applied[migration.Version] {
+			fmt.Printf("Migration %d (%s) already applied, skipping\n", migration.Version, migration.Name)
+			continue
+		}
+		
+		fmt.Printf("Applying migration %d: %s\n", migration.Version, migration.Name)
+		
+		// Start transaction
+		tx, err := db.Begin()
+		if err != nil {
+			return fmt.Errorf("failed to start transaction for migration %d: %v", migration.Version, err)
+		}
+		
+		// Execute migration
+		_, err = tx.Exec(migration.SQL)
+		if err != nil {
+			tx.Rollback()
+			return fmt.Errorf("failed to execute migration %d: %v", migration.Version, err)
+		}
+		
+		// Record migration as applied
+		_, err = tx.Exec("INSERT INTO schema_migrations (version, name) VALUES (?, ?)", migration.Version, migration.Name)
+		if err != nil {
+			tx.Rollback()
+			return fmt.Errorf("failed to record migration %d: %v", migration.Version, err)
+		}
+		
+		// Commit transaction
+		if err = tx.Commit(); err != nil {
+			return fmt.Errorf("failed to commit migration %d: %v", migration.Version, err)
+		}
+		
+		fmt.Printf("Migration %d applied successfully\n", migration.Version)
+	}
+	
+	return nil
+}
+
 // Initialize message store
 func NewMessageStore() (*MessageStore, error) {
 	// Create directory for database if it doesn't exist
@@ -67,37 +216,10 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
 
-	// Create tables if they don't exist
-	_, err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS chats (
-			jid TEXT PRIMARY KEY,
-			name TEXT,
-			last_message_time TIMESTAMP,
-			unread_count INTEGER DEFAULT 0
-		);
-		
-		CREATE TABLE IF NOT EXISTS messages (
-			id TEXT,
-			chat_jid TEXT,
-			sender TEXT,
-			content TEXT,
-			timestamp TIMESTAMP,
-			is_from_me BOOLEAN,
-			media_type TEXT,
-			filename TEXT,
-			url TEXT,
-			media_key BLOB,
-			file_sha256 BLOB,
-			file_enc_sha256 BLOB,
-			file_length INTEGER,
-			is_read BOOLEAN DEFAULT FALSE,
-			PRIMARY KEY (id, chat_jid),
-			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
-		);
-	`)
-	if err != nil {
+	// Run database migrations
+	if err = RunMigrations(db); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("failed to create tables: %v", err)
+		return nil, fmt.Errorf("failed to run migrations: %v", err)
 	}
 
 	return &MessageStore{db: db}, nil
@@ -114,8 +236,7 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 		"INSERT OR REPLACE INTO chats (jid, name, last_message_time, unread_count) VALUES (?, ?, ?, ?)",
 		jid, name, lastMessageTime, unreadCount,
 	)
-	// Log the unread count update
-	fmt.Printf("StoreChat: Updating chat %s with unread count: %d\n", jid, unreadCount)
+	// Update chat with unread count
 	return err
 }
 
@@ -196,7 +317,7 @@ func (store *MessageStore) GetUnreadCount(chatJID string) (uint32, error) {
 // Mark chat as read
 func (store *MessageStore) MarkChatAsRead(chatJID string) error {
 	_, err := store.db.Exec("UPDATE chats SET unread_count = 0 WHERE jid = ?", chatJID)
-	fmt.Printf("MarkChatAsRead: Marking chat %s as read\n", chatJID)
+	// Mark chat as read in database
 	return err
 }
 
@@ -204,7 +325,7 @@ func (store *MessageStore) MarkChatAsRead(chatJID string) error {
 func (store *MessageStore) MarkChatAsUnread(chatJID string) error {
 	// Set unread count to 1 to indicate unread status
 	_, err := store.db.Exec("UPDATE chats SET unread_count = 1 WHERE jid = ?", chatJID)
-	fmt.Printf("MarkChatAsUnread: Marking chat %s as unread\n", chatJID)
+	// Mark chat as unread in database
 	return err
 }
 
@@ -533,11 +654,16 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			direction = "→"
 		}
 
-		// Log based on message type
+		// Log based on message type with clear status
+		status := "RECEIVED"
+		if msg.Info.IsFromMe {
+			status = "SENT"
+		}
+		
 		if mediaType != "" {
-			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
+			fmt.Printf("[%s] %s %s %s: [%s: %s] %s\n", timestamp, status, direction, sender, mediaType, filename, content)
 		} else if content != "" {
-			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
+			fmt.Printf("[%s] %s %s %s: %s\n", timestamp, status, direction, sender, content)
 		}
 	}
 }
@@ -948,15 +1074,15 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 				// Log the stored message similar to incoming messages
 				timestamp := time.Now().Format("2006-01-02 15:04:05")
 				if mediaType != "" {
-					fmt.Printf("[%s] → %s: [%s: %s] %s\n", timestamp, req.Recipient, mediaType, filename, req.Message)
+					fmt.Printf("[%s] SENT → %s: [%s: %s] %s\n", timestamp, req.Recipient, mediaType, filename, req.Message)
 				} else if req.Message != "" {
-					fmt.Printf("[%s] → %s: %s\n", timestamp, req.Recipient, req.Message)
+					fmt.Printf("[%s] SENT → %s: %s\n", timestamp, req.Recipient, req.Message)
 				}
 			}
 
 			// Update chat with the new message timestamp
 			name := req.Recipient // Simple fallback name
-			err = messageStore.StoreChat(chatJID, name, time.Now())
+			err = messageStore.StoreChat(chatJID, name, time.Now(), 0)
 			if err != nil {
 				fmt.Printf("Failed to update chat: %v\n", err)
 			}
@@ -1247,7 +1373,7 @@ func main() {
 
 		case *events.MarkChatAsRead:
 			// Handle chat read status changes from other devices
-			fmt.Printf("MarkChatAsRead: %v\n", v)
+			// Handle chat read status changes from other devices
 			handleMarkChatAsRead(messageStore, v, logger)
 
 		case *events.Connected:
@@ -1257,7 +1383,6 @@ func main() {
 			logger.Warnf("Device logged out, please scan QR code to log in again")
 		case *events.Receipt:
 			// Handle receipt events (when someone reads a message we sent)
-			fmt.Printf("Received receipt: %v\n", v)
 			handleReceipt(messageStore, v, logger)
 		}
 	})
@@ -1338,7 +1463,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
 	if err == nil && existingName != "" {
 		// Chat exists with a name, use that
-		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
+		// Using existing chat name (debug info silenced)
 		return existingName
 	}
 
@@ -1807,11 +1932,9 @@ func handleMarkChatAsRead(messageStore *MessageStore, evt *events.MarkChatAsRead
 // Handle receipt events (e.g., when someone reads a message we sent)
 func handleReceipt(messageStore *MessageStore, receipt *events.Receipt, logger waLog.Logger) {
 	chatJID := receipt.Chat.String()
-	// Print receipt details for debugging
-	fmt.Printf("Receipt details: chat=%s, sender=%s, isFromMe=%v, messageIDs=%v\n",
-		chatJID, receipt.Sender.User, receipt.IsFromMe, receipt.MessageIDs)
+	// Process receipt event
 
-	logger.Infof("Received receipt for messages not in database - can't update read status for specific messages")
+	// Receipt processed - message read status handling
 	// Although we don't have the specific messages, if this is a receipt we generated,
 	// we can still update the chat's unread count
 	if receipt.IsFromMe {
@@ -1819,7 +1942,7 @@ func handleReceipt(messageStore *MessageStore, receipt *events.Receipt, logger w
 		if err != nil {
 			logger.Warnf("Failed to mark chat %s as read: %v", chatJID, err)
 		} else {
-			fmt.Printf("Received receipt for our read action - marking chat %s as read\n", chatJID)
+			// Chat marked as read
 		}
 	}
 
@@ -1836,14 +1959,14 @@ func handleReceipt(messageStore *MessageStore, receipt *events.Receipt, logger w
 			if err != nil {
 				logger.Warnf("Failed to mark chat %s as read: %v", chatJID, err)
 			} else {
-				fmt.Printf("We've read incoming messages in chat %s - marking chat as read\n", chatJID)
+				// Incoming messages marked as read
 			}
 		} else {
-			fmt.Printf("We've read our own messages in chat %s - not changing unread count\n", chatJID)
+			// Own messages read - no unread count change
 		}
 	} else {
 		// This is a receipt from another user indicating they've read our messages
-		fmt.Printf("User %s has read our messages in chat %s\n", receipt.Sender.User, chatJID)
+		// User has read our messages
 	}
 }
 
